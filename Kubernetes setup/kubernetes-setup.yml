@@ -1,0 +1,115 @@
+---
+- name: Setup Kubernetes cluster
+  hosts: k8s_cluster
+  become: yes
+  tasks:
+    - name: Update and upgrade packages
+      apt:
+        update_cache: yes
+        upgrade: safe
+
+    - name: Install required packages
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - software-properties-common
+        state: present
+
+    - name: Add Docker repository and import its GPG key
+      ansible.builtin.apt_repository:
+        repo: "deb [arch=amd64 signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+        state: present
+      register: add_docker_repository
+
+    - name: Add Docker GPG key
+      ansible.builtin.apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        keyring: /usr/share/keyrings/docker-archive-keyring.gpg
+      when: add_docker_repository is changed
+
+    - name: Install Docker
+      apt:
+        update_cache: yes
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+        state: present
+
+    - name: Start and enable Docker
+      systemd:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Add Kubernetes repository and import its GPG key
+      ansible.builtin.apt_repository:
+        repo: "deb http://apt.kubernetes.io/ kubernetes-xenial main"
+        state: present
+      register: add_kubernetes_repository
+
+    - name: Add Kubernetes GPG key
+      ansible.builtin.apt_key:
+        url: https://packages.cloud.google.com/apt/doc/apt-key.gpg
+      when: add_kubernetes_repository is changed
+
+    - name: Install Kubernetes components
+      apt:
+        update_cache: yes
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+
+    - name: Hold Kubernetes components
+      command: apt-mark hold kubelet kubeadm kubectl
+
+- name: Initialize Kubernetes master
+  hosts: master
+  become: yes
+  tasks:
+    - name: Initialize the Kubernetes cluster
+      command: kubeadm init --pod-network-cidr=192.168.0.0/16
+      register: kubeadm_init_output
+
+    - name: Configure kubectl for root user
+      block:
+        - name: Create Kubernetes config directory for root user
+          file:
+            path: /root/.
+            state: directory
+
+        - name: Copy Kubernetes admin.conf to root user's config directory
+          copy:
+            src: /etc/kubernetes/admin.conf
+            dest: /root/.kube/config
+            owner: root
+            group: root
+            mode: '0644'
+
+    - name: Deploy Calico pod network
+      environment:
+        KUBECONFIG: /root/.kube/config
+      command: kubectl apply -f https://docs.projectcalico.org/manifests/calico.yaml
+
+- name: Join worker nodes to the cluster
+  hosts: k8s_cluster:!master
+  become: yes
+  tasks:
+    - name: Retrieve the join command from the master node
+      ansible.builtin.slurp:
+        src: /tmp/kubeadm_join
+      register: kubeadm_join_cmd
+      delegate_to: "{{ groups['master'][0] }}"
+      run_once: true
+
+    - name: Decode the join command
+      set_fact:
+        kubeadm_join: "{{ (kubeadm_join_cmd['content'] | b64decode).strip() }}"
+      run_once: true
+
+    - name: Join the Kubernetes cluster
+      command: "{{ kubeadm_join }}"
